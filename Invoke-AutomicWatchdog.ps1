@@ -1,101 +1,105 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Watchdog fuer Automic (UC4) Service-Manager-Prozesse: prueft, ob alle
-    erforderlichen Prozesse laufen, und startet fehlende automatisch nach.
+    Watchdog for Automic (UC4) Service Manager processes: checks whether all
+    required processes are running and automatically restarts any that are missing.
 
 .DESCRIPTION
-    Das Skript ueberspringt seine Pruef-/Restart-Logik in drei Situationen:
-      1. Ein manueller Wartungsmodus ist ueber eine Flag-Datei aktiviert
-         (siehe Test-MaintenanceModeActive).
-      2. Es ist gerade ein beabsichtigter System-Shutdown/Reboot im Gange
-         (erkannt ueber Event-ID 1074 im System-Log).
-      3. Der Server ist erst kuerzlich gebootet und der Automic Service Manager
-         faehrt die Prozesse voraussichtlich noch geordnet hoch (Grace Period
-         basierend auf LastBootUpTime).
+    The script skips its check/restart logic in three situations:
+      1. A manual maintenance mode has been activated via a flag file
+         (see Test-MaintenanceModeActive).
+      2. An intentional system shutdown/reboot is currently in progress
+         (detected via Event ID 1074 in the System log).
+      3. The server has just booted and the Automic Service Manager is
+         presumably still bringing processes up in an orderly fashion
+         (grace period based on LastBootUpTime).
 
 .USAGE
-    Gedacht zum Einsatz als wiederkehrender Task im Windows Task Scheduler:
+    Intended to run as a recurring task in Windows Task Scheduler:
 
-      1. Aktion:  "Programm starten"
-         Programm/Skript:  powershell.exe
-         Argumente:        -NoProfile -ExecutionPolicy Bypass -File "C:\Pfad\zu\Invoke-AutomicWatchdog.ps1"
+      1. Action: "Start a program"
+         Program/script:  powershell.exe
+         Arguments:       -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\Invoke-AutomicWatchdog.ps1"
 
-      2. Trigger: "Bei Anmeldung" bzw. "Taeglich", mit aktivierter Option
-         "Aufgabe wiederholen alle: 5 Minuten" fuer eine Dauer von "Unbegrenzt".
+      2. Trigger: "At log on" or "Daily", with "Repeat task every: 5 minutes"
+         enabled, for a duration of "Indefinitely".
 
-      3. Konto: ein Konto verwenden, das Leserechte auf die Wartungsflag-Datei
-         und Ausfuehrungsrechte fuer ucybsmcl.exe hat ("Unabhaengig von der
-         Benutzeranmeldung ausfuehren" aktivieren, damit der Task auch ohne
-         angemeldete Session laeuft).
+      3. Account: use an account that has read access to the maintenance flag
+         file and permission to run ucybsmcl.exe (enable "Run whether user is
+         logged on or not" so the task also runs without an active session).
 
-    WICHTIG - Zusammenhang mit dem Scheduler-Intervall:
-      Die Logdatei-Bereinigung (siehe $LogRetentionDays / Invoke-LogFileCleanup)
-      laeuft nur innerhalb eines taeglichen Zeitfensters (Default: die volle
-      Stunde 00:00-00:59), NICHT bei jedem einzelnen Lauf. Ist das Scheduler-
-      Intervall groesser als dieses Fenster (z. B. Trigger alle 90 Minuten),
-      kann es vorkommen, dass an einzelnen Tagen KEIN Lauf in dieses Fenster
-      faellt und die Bereinigung an diesem Tag ausfaellt - unkritisch, sie
-      holt es am naechsten Tag nach. Ist das Intervall dagegen sehr kurz
-      (z. B. alle 5 Minuten), wird die Logdatei innerhalb des Fensters
-      mehrfach komplett eingelesen (im Beispiel bis zu 12x), aber nur beim
-      ERSTEN Treffer tatsaechlich neu geschrieben (siehe $removedCount-Check) -
-      das ist bewusst so und unkritisch. Bei sehr grossen Logdateien und sehr
-      kurzen Intervallen (< 1 Minute) sollte das Fenster ggf. verkleinert
-      werden.
+    IMPORTANT - relationship with the scheduler interval:
+      Log file cleanup (see $LogRetentionDays / Invoke-LogFileCleanup) only
+      runs within a daily time window (default: the full hour 00:00-00:59),
+      NOT on every single run. If the scheduler interval is larger than this
+      window (e.g. a trigger every 90 minutes), it's possible that on some
+      days NO run falls within this window and cleanup is skipped that day -
+      harmless, it catches up the next day. If the interval is very short
+      instead (e.g. every 5 minutes), the log file gets read in full multiple
+      times within the window (up to 12x in that example), but is only
+      actually rewritten on the FIRST match (see the $removedCount check) -
+      this is intentional and harmless. With very large log files and very
+      short intervals (< 1 minute), the window may need to be narrowed.
+
+.NOTES
+    Author:     René Kappel
+    Repository: https://github.com/rkappel/Automic-Process-Watchdog
+    License:    MIT
+    Version:    1.0.0
+    Created:    2026-08-21
 #>
 
 [CmdletBinding()]
 param()
 
 # ============================================================
-# KONFIGURATION
+# CONFIGURATION
 # ============================================================
 
-# Zeitfenster (Minuten), innerhalb dessen ein Event 1074 als
-# "aktuell laufender, beabsichtigter Shutdown" gewertet wird.
+# Time window (minutes) within which an Event 1074 is considered an
+# "intentional shutdown currently in progress".
 $ShutdownLookbackMinutes = 5
 
-# Zeitfenster (Minuten) nach dem Boot, in dem davon ausgegangen wird,
-# dass der Automic Service Manager die Prozesse noch geordnet hochfaehrt.
+# Time window (minutes) after boot during which the Automic Service Manager
+# is assumed to still be bringing processes up in an orderly fashion.
 $StartupGraceMinutes = 10
 
-# Windows-Servicename des Automic Service Managers.
+# Windows service name of the Automic Service Manager.
 $ServiceManagerServiceName = 'UC4.ServiceManager.WS21'
 
-# Pfad zur SMC-Konfigurationsdatei, die die erwarteten Prozesse definiert.
+# Path to the SMC configuration file that defines the expected processes.
 $SmcFilePath = 'C:\uc4\V21.0\ServiceManager\bin\ws21.smc'
 
-# Pfad zu ucybsmcl.exe (ServiceManager CLI).
+# Path to ucybsmcl.exe (Service Manager CLI).
 $UcybsmclPath = 'C:\uc4\V21.0\ServiceManagerDialog\bin\ucybsmcl.exe'
 
-# Computername (inkl. Port) fuer -h Parameter von ucybsmcl.
+# Computer name (including port) for the -h parameter of ucybsmcl.
 $ServiceManagerComputerName = $env:COMPUTERNAME + ':18821'
 
-# ServiceManager-Environment ("Phrase") fuer -n Parameter von ucybsmcl.
+# Service Manager environment ("Phrase") for the -n parameter of ucybsmcl.
 $ServiceManagerPhrase = 'ws21'
 
-# Pfad zur Wartungsflag-Datei. Existenz der Datei = Wartungsmodus aktiv.
-# Format und Verhalten siehe Doku-Kommentar bei Test-MaintenanceModeActive.
+# Path to the maintenance flag file. File exists = maintenance mode active.
+# See the doc comment on Test-MaintenanceModeActive for format and behavior.
 $MaintenanceFlagFilePath = 'C:\ProgramData\AutomicMonitoring\maintenance.flag'
 
-# Ab welchem Level wird geloggt: DEBUG < INFO < WARN < ERROR.
-# DEBUG zeigt zusaetzlich die vollstaendige Rohausgabe von ucybsmcl bei Fehlern -
-# im Normalbetrieb auf INFO lassen, fuer Troubleshooting auf DEBUG stellen.
+# Minimum level that gets logged: DEBUG < INFO < WARN < ERROR.
+# Leave at INFO for normal operation; set to DEBUG for troubleshooting - this
+# additionally shows the full raw ucybsmcl output on failures.
 $MinimumLogLevel = 'INFO'
 
-# Optionaler Logpfad. $null = nur Konsolenausgabe (z. B. bei interaktivem Test
-# oder wenn der Scheduled Task die Ausgabe ohnehin protokolliert).
-$LogFile = $null   # z. B. 'C:\Logs\Check-AutomicProcesses.log'
+# Optional log file path. $null = console output only (e.g. for interactive
+# testing, or when the scheduled task already captures the output itself).
+$LogFile = $null   # e.g. 'C:\Logs\Check-AutomicProcesses.log'
 
-# Logeintraege, die aelter als diese Anzahl Tage sind, werden automatisch
-# entfernt (ca. 6 Monate). Die Bereinigung laeuft nur einmal taeglich
-# (siehe Invoke-LogFileCleanup), nicht bei jedem 5-Minuten-Lauf.
+# Log entries older than this many days are automatically removed
+# (roughly 6 months). Cleanup runs only once a day (see Invoke-LogFileCleanup),
+# not on every 5-minute run.
 $LogRetentionDays = 180
 
 
 # ============================================================
-# HILFSFUNKTIONEN: LOGGING
+# HELPER FUNCTIONS: LOGGING
 # ============================================================
 
 $script:LogLevelOrder = @{ DEBUG = 0; INFO = 1; WARN = 2; ERROR = 3 }
@@ -115,13 +119,12 @@ function Write-Log {
 
     $line = "{0:yyyy-MM-dd HH:mm:ss}  [{1}]  {2}" -f (Get-Date), $Level, $Message
 
-    # WICHTIG: Write-Host statt Write-Output! Write-Log wird aus vielen Funktionen
-    # heraus aufgerufen (Gates, Invoke-Ucybsmcl, ...). Write-Output wuerde die
-    # Logzeile in die Erfolgs-Pipeline dieser Funktionen einschleusen und damit
-    # deren eigentlichen Rueckgabewert verfaelschen (z. B. wird aus "return $false"
-    # ein nicht-leeres Array [Logzeile, $false] - und das ist in PowerShell
-    # truthy). Write-Host schreibt direkt auf die Konsole, ohne die Pipeline
-    # zu beeinflussen.
+    # IMPORTANT: Write-Host, not Write-Output! Write-Log is called from many
+    # functions (gates, Invoke-Ucybsmcl, ...). Write-Output would inject the
+    # log line into that function's success pipeline and corrupt its actual
+    # return value (e.g. "return $false" would turn into a non-empty array
+    # [logLine, $false] - and that is truthy in PowerShell). Write-Host writes
+    # directly to the console without affecting the pipeline.
     Write-Host $line
 
     if ($LogFile) {
@@ -131,25 +134,25 @@ function Write-Log {
 
 
 # ============================================================
-# Log-Datei bereinigen (Eintraege > $LogRetentionDays entfernen)
+# Clean up the log file (remove entries older than $LogRetentionDays)
 # ============================================================
 
 function Invoke-LogFileCleanup {
     <#
-        Entfernt Zeilen aus der Logdatei, deren Zeitstempel aelter als
-        $LogRetentionDays ist. Zeilen ohne erkennbaren Zeitstempel am
-        Zeilenanfang (z. B. mehrzeilige DEBUG-Ausgaben von ucybsmcl) werden
-        sicherheitshalber behalten statt geraten geloescht zu werden.
+        Removes lines from the log file whose timestamp is older than
+        $LogRetentionDays. Lines without a recognizable timestamp at the
+        start of the line (e.g. multi-line DEBUG output from ucybsmcl) are
+        kept as a precaution rather than being guessed at and deleted.
 
-        Laeuft bewusst nur einmal taeglich (innerhalb der Stunde 00:00-00:59),
-        nicht bei jedem 5-Minuten-Lauf - sonst wird bei grossen Logdateien
-        unnoetig oft die komplette Datei neu eingelesen und geschrieben.
-        Das volle Stundenfenster (statt z. B. nur der ersten 5 Minuten) ist
-        bewusst grosszuegig gewaehlt: es toleriert unterschiedliche Scheduler-
-        Intervalle (siehe Hinweis im Datei-Header), ohne dass die Bereinigung
-        an einzelnen Tagen komplett ausfaellt. Mehrfaches Lesen innerhalb der
-        Stunde ist billig, geschrieben wird ohnehin nur beim ersten Treffer
-        (siehe $removedCount-Check unten).
+        Deliberately runs only once a day (within the hour 00:00-00:59), not
+        on every 5-minute run - otherwise large log files would be needlessly
+        re-read and rewritten in full on every single run. The full one-hour
+        window (rather than, say, just the first 5 minutes) is intentionally
+        generous: it tolerates different scheduler intervals (see the note in
+        the file header) without cleanup being skipped entirely on some days.
+        Reading multiple times within the hour is cheap; the file is only
+        ever rewritten on the first match anyway (see the $removedCount
+        check below).
     #>
     param(
         [string]$Path          = $LogFile,
@@ -183,35 +186,35 @@ function Invoke-LogFileCleanup {
     $removedCount = $original.Count - $kept.Count
     if ($removedCount -gt 0) {
         Set-Content -LiteralPath $Path -Value $kept -Encoding UTF8
-        Write-Log "Logbereinigung: $removedCount Eintraege aelter als $RetentionDays Tage entfernt."
+        Write-Log "Log cleanup: removed $removedCount entries older than $RetentionDays days."
     }
 }
 
 
 # ============================================================
-# HILFSFUNKTION: ucybsmcl kapseln, Fehlerausgabe kompakt halten
+# HELPER FUNCTION: wrap ucybsmcl, keep error output compact
 # ============================================================
 
-# Bekannte Exitcodes von ucybsmcl (siehe -help / Automic-Doku).
+# Known exit codes of ucybsmcl (see -help / Automic documentation).
 $script:UcybsmclExitCodeDescriptions = @{
     0 = 'OK'
     1 = 'Invalid parameters'
-    2 = 'Kein aktiver ServiceManager auf dem angegebenen Host'
-    3 = 'ServiceManager verhaelt sich unerwartet'
-    4 = 'Pipe-Fehler'
-    5 = 'Kein ServiceManager mit dem angegebenen Instanznamen'
+    2 = 'No active Service Manager on the specified host'
+    3 = 'Service Manager behaves unexpectedly'
+    4 = 'Pipe error'
+    5 = 'No Service Manager with the specified instance name'
 }
 
 function Invoke-Ucybsmcl {
     <#
-        Zentraler Wrapper fuer alle ucybsmcl-Aufrufe.
+        Central wrapper for all ucybsmcl calls.
 
-        ucybsmcl gibt bei einem Fehler (z. B. falsche Parameter) den kompletten
-        Hilfetext auf STDERR aus. Das ist im Log unbrauchbar, wenn es bei jedem
-        Fehlschlag erneut abgedruckt wird. Diese Funktion loggt deshalb im
-        Fehlerfall nur eine knappe Zusammenfassung (Exitcode + Bedeutung + erste
-        Zeile der Ausgabe) auf ERROR-Level; die vollstaendige Rohausgabe landet
-        nur auf DEBUG-Level (und wird damit standardmaessig unterdrueckt).
+        On error (e.g. wrong parameters), ucybsmcl prints its complete help
+        text to STDERR. That's unusable in the log if it gets printed again
+        on every single failure. This function therefore logs only a compact
+        summary (exit code + meaning + first line of output) at ERROR level
+        on failure; the full raw output only goes to DEBUG level (and is
+        therefore suppressed by default).
     #>
     param(
         [Parameter(Mandatory)]
@@ -227,13 +230,13 @@ function Invoke-Ucybsmcl {
     $description = if ($script:UcybsmclExitCodeDescriptions.ContainsKey($exitCode)) {
         $script:UcybsmclExitCodeDescriptions[$exitCode]
     } else {
-        'Unbekannter Exitcode'
+        'Unknown exit code'
     }
 
     if ($exitCode -ne 0) {
         $firstLine = $output | Where-Object { $_ -and $_.ToString().Trim() -ne '' } | Select-Object -First 1
-        Write-Log "$Context fehlgeschlagen - Exitcode $exitCode ($description): $firstLine" -Level 'ERROR'
-        Write-Log ("Vollstaendige ucybsmcl-Ausgabe fuer '$Context':`n" + ($output -join [Environment]::NewLine)) -Level 'DEBUG'
+        Write-Log "$Context failed - exit code $exitCode ($description): $firstLine" -Level 'ERROR'
+        Write-Log ("Full ucybsmcl output for '$Context':`n" + ($output -join [Environment]::NewLine)) -Level 'DEBUG'
     }
 
     return [PSCustomObject]@{
@@ -245,34 +248,33 @@ function Invoke-Ucybsmcl {
 
 
 # ============================================================
-# GATE 1: Manueller Wartungsmodus aktiv? (Flag-Datei)
+# GATE 1: Manual maintenance mode active? (flag file)
 # ============================================================
 
 function Test-MaintenanceModeActive {
     <#
-        Prueft, ob die Wartungsflag-Datei existiert und (noch) gueltig ist.
+        Checks whether the maintenance flag file exists and is (still) valid.
 
-        FORMAT DER FLAG-DATEI (eine "Key: Value"-Zeile pro Eintrag, Keys englisch):
+        FLAG FILE FORMAT (one "Key: Value" line per entry, English keys):
 
             Until: 2026-08-21 14:00
             Reason: Patchday
             By: René
 
-        - Until  : Optional, aber empfohlen. Format 'yyyy-MM-dd HH:mm' (bzw. jedes
-                   von [DateTime]::TryParse erkannte Format). Dient als Sicherheitsnetz:
-                   ist der Zeitpunkt ueberschritten, gilt der Wartungsmodus als
-                   NICHT mehr aktiv, selbst wenn die Datei noch existiert (z. B. weil
-                   das Loeschen nach einem Wartungsfenster vergessen wurde).
-                   Fehlt Until, bleibt der Wartungsmodus unbegrenzt aktiv, bis die
-                   Datei manuell entfernt wird.
-        - Reason : Optional, rein informativ - landet im Log.
-        - By     : Optional, rein informativ - landet im Log.
+        - Until  : Optional, but recommended. Format 'yyyy-MM-dd HH:mm' (or
+                   any format recognized by [DateTime]::TryParse). Acts as a
+                   safety net: once this point in time has passed, maintenance
+                   mode is considered NO LONGER active even if the file still
+                   exists (e.g. because deleting it after a maintenance window
+                   was forgotten). If Until is omitted, maintenance mode stays
+                   active indefinitely until the file is removed manually.
+        - Reason : Optional, informational only - goes into the log.
+        - By     : Optional, informational only - goes into the log.
 
-        Existiert die Datei nicht -> kein Wartungsmodus, Rueckgabe $false.
+        If the file does not exist -> no maintenance mode, returns $false.
 
-        Zum Aktivieren/Beenden ist ausschliesslich das Anlegen/Loeschen dieser
-        Datei noetig - das Skript selbst muss dafuer nicht angefasst werden,
-        z. B.:
+        Activating/ending maintenance mode only requires creating/deleting
+        this file - the script itself does not need to be touched, e.g.:
             "Until: $((Get-Date).AddHours(2).ToString('yyyy-MM-dd HH:mm'))`nReason: Patchday`nBy: $env:USERNAME" |
                 Set-Content 'C:\ProgramData\AutomicMonitoring\maintenance.flag'
     #>
@@ -291,8 +293,8 @@ function Test-MaintenanceModeActive {
         }
     }
 
-    $reason = if ($fields.ContainsKey('Reason')) { $fields['Reason'] } else { '(nicht angegeben)' }
-    $by     = if ($fields.ContainsKey('By'))     { $fields['By'] }     else { '(nicht angegeben)' }
+    $reason = if ($fields.ContainsKey('Reason')) { $fields['Reason'] } else { '(not specified)' }
+    $by     = if ($fields.ContainsKey('By'))     { $fields['By'] }     else { '(not specified)' }
 
     if ($fields.ContainsKey('Until')) {
         $untilRaw    = $fields['Until']
@@ -300,38 +302,38 @@ function Test-MaintenanceModeActive {
 
         if ([DateTime]::TryParse($untilRaw, [ref]$parsedUntil)) {
             $now = Get-Date
-            Write-Log "Wartungsflag: Vergleiche Now ($($now.ToString('yyyy-MM-dd HH:mm:ss'))) mit Until ($($parsedUntil.ToString('yyyy-MM-dd HH:mm:ss')))." -Level 'DEBUG'
+            Write-Log "Maintenance flag: comparing Now ($($now.ToString('yyyy-MM-dd HH:mm:ss'))) with Until ($($parsedUntil.ToString('yyyy-MM-dd HH:mm:ss')))." -Level 'DEBUG'
 
             if ($now -gt $parsedUntil) {
-                Write-Log "Wartungsflag gefunden, aber 'Until' ($untilRaw) liegt in der Vergangenheit - wird ignoriert." -Level 'WARN'
+                Write-Log "Maintenance flag found, but 'Until' ($untilRaw) is in the past - ignoring it." -Level 'WARN'
 
-                # Best-effort: abgelaufene Flag-Datei automatisch aufraeumen.
-                # Fehlschlag (z. B. fehlende Rechte, Datei gerade gesperrt) wird
-                # bewusst nur als WARN geloggt und ignoriert - beim naechsten
-                # Lauf wird der Loeschversuch einfach wiederholt.
+                # Best effort: automatically clean up the expired flag file.
+                # A failure (e.g. missing permissions, file currently locked)
+                # is deliberately only logged as WARN and ignored - the next
+                # run will simply try to delete it again.
                 try {
                     Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
-                    Write-Log "Abgelaufene Wartungsflag-Datei automatisch entfernt: $Path"
+                    Write-Log "Expired maintenance flag file removed automatically: $Path"
                 } catch {
-                    Write-Log "Abgelaufene Wartungsflag-Datei konnte nicht geloescht werden (wird ignoriert, naechster Versuch beim naechsten Lauf): $($_.Exception.Message)" -Level 'WARN'
+                    Write-Log "Could not delete the expired maintenance flag file (ignoring, will retry on the next run): $($_.Exception.Message)" -Level 'WARN'
                 }
 
                 return $false
             }
         } else {
-            Write-Log "Wartungsflag: 'Until'-Wert '$untilRaw' konnte nicht geparst werden - wird ignoriert (kein Ablaufschutz aktiv fuer diesen Eintrag)." -Level 'WARN'
+            Write-Log "Maintenance flag: could not parse 'Until' value '$untilRaw' - ignoring it (no expiry protection active for this entry)." -Level 'WARN'
         }
     } else {
-        Write-Log "Wartungsflag ohne 'Until' gesetzt - bleibt unbegrenzt aktiv bis zum manuellen Loeschen der Datei." -Level 'WARN'
+        Write-Log "Maintenance flag set without 'Until' - stays active indefinitely until the file is deleted manually." -Level 'WARN'
     }
 
-    Write-Log "Wartungsmodus aktiv (Reason: $reason, By: $by)."
+    Write-Log "Maintenance mode active (Reason: $reason, By: $by)."
     return $true
 }
 
 
 # ============================================================
-# GATE 2: Beabsichtigter Shutdown im Gange?
+# GATE 2: Intentional shutdown in progress?
 # ============================================================
 
 function Test-IntendedShutdownPending {
@@ -352,7 +354,7 @@ function Test-IntendedShutdownPending {
 
 
 # ============================================================
-# GATE 3: Server befindet sich noch in der Startup-Grace-Period?
+# GATE 3: Server still within the startup grace period?
 # ============================================================
 
 function Test-InStartupGracePeriod {
@@ -368,24 +370,24 @@ function Test-InStartupGracePeriod {
 
 
 # ============================================================
-# Sollprozesse aus der SMC-Datei einlesen
+# Read the required processes from the SMC file
 # ============================================================
 
 function Get-RequiredAutomicProcesses {
     <#
-        Liest die SMC-Datei zeilenweise ein und liefert die Namen der aktiven
-        'create'-Eintraege. Deaktivierte Zeilen (z. B. "!reate ...") matchen
-        bewusst nicht, da sie nicht mit 'create' beginnen.
+        Reads the SMC file line by line and returns the names of the active
+        'create' entries. Disabled lines (e.g. "!reate ...") deliberately do
+        not match, since they don't start with 'create'.
 
-        Regex auf WP/CP/JWP/JCP/REST-Prozesse eingeschraenkt (an die
-        tatsaechliche Umgebung angepasst).
+        Regex restricted to WP/CP/JWP/JCP/REST processes (tailored to the
+        actual environment).
     #>
     param(
         [string]$Path = $SmcFilePath
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        Write-Log "SMC-Datei nicht gefunden: $Path" -Level 'ERROR'
+        Write-Log "SMC file not found: $Path" -Level 'ERROR'
         return @()
     }
 
@@ -400,20 +402,20 @@ function Get-RequiredAutomicProcesses {
 
 
 # ============================================================
-# Laufende Services per ucybsmcl abfragen
+# Query running services via ucybsmcl
 # ============================================================
 
 function Get-AutomicRunningServices {
     <#
-        Ruft "ucybsmcl -c GET_PROCESS_LIST" auf und parst die Ausgabe.
+        Calls "ucybsmcl -c GET_PROCESS_LIST" and parses the output.
 
-        Ausgabeformat laut Automic-Doku:
+        Output format per Automic documentation:
             "Service" "Status" ["ProcID" "Start time" "Runtime" "CPU Time"]
         Status: "R" = Running, "S" = Stopped
 
-        Liefert ein Array von PSCustomObjects mit Name/Status fuer ALLE
-        bekannten Services (nicht nur die laufenden) - Filterung erfolgt
-        beim Aufrufer.
+        Returns an array of PSCustomObjects with Name/Status for ALL known
+        services (not just the running ones) - filtering happens on the
+        caller's side.
     #>
 
     $result = Invoke-Ucybsmcl -Context 'GET_PROCESS_LIST' -ArgumentList @(
@@ -440,21 +442,21 @@ function Get-AutomicRunningServices {
 
 
 # ============================================================
-# Abgleich: welche Sollprozesse laufen nicht?
+# Diff: which required processes are not running?
 # ============================================================
 
 function Get-MissingAutomicProcesses {
     <#
-        Vergleicht die Sollliste aus der SMC-Datei mit den tatsaechlich
-        laufenden (Status "R") Services.
+        Compares the required list from the SMC file against the actually
+        running (Status "R") services.
 
-        Rueckgabe: Array der fehlenden Prozessnamen (leer = alles ok).
+        Returns: array of missing process names (empty = all good).
     #>
 
     $required = Get-RequiredAutomicProcesses
 
     if ($required.Count -eq 0) {
-        Write-Log "Keine aktiven 'create'-Eintraege in der SMC-Datei gefunden - Pruefung uebersprungen." -Level 'WARN'
+        Write-Log "No active 'create' entries found in the SMC file - check skipped." -Level 'WARN'
         return @()
     }
 
@@ -468,15 +470,14 @@ function Get-MissingAutomicProcesses {
 
 
 # ============================================================
-# Fehlende Prozesse nachstarten
+# Restart missing processes
 # ============================================================
 
 function Start-AutomicProcesses {
     <#
-        Startet die uebergebenen Prozessnamen nacheinander per
-        "ucybsmcl -c START_PROCESS". Ein fehlgeschlagener Start bricht die
-        Schleife nicht ab, sondern wird geloggt - die uebrigen Prozesse
-        werden trotzdem versucht.
+        Starts the given process names one after another via
+        "ucybsmcl -c START_PROCESS". A failed start does not abort the loop -
+        it's logged and the remaining processes are still attempted.
     #>
     param(
         [Parameter(Mandatory)]
@@ -484,7 +485,7 @@ function Start-AutomicProcesses {
     )
 
     foreach ($name in $ProcessNames) {
-        Write-Log "Starte Prozess '$name' ..."
+        Write-Log "Starting process '$name' ..."
 
         $result = Invoke-Ucybsmcl -Context "START_PROCESS '$name'" -ArgumentList @(
             '-c', 'START_PROCESS',
@@ -494,46 +495,46 @@ function Start-AutomicProcesses {
         )
 
         if ($result.Success) {
-            Write-Log "Prozess '$name' erfolgreich gestartet."
+            Write-Log "Process '$name' started successfully."
         }
-        # Fehlerfall wird bereits kompakt von Invoke-Ucybsmcl geloggt.
+        # Failure is already logged compactly by Invoke-Ucybsmcl.
     }
 }
 
 
 # ============================================================
-# HAUPTABLAUF
+# MAIN
 # ============================================================
 
 Invoke-LogFileCleanup
 
-Write-Log "Pruefung gestartet."
+Write-Log "Check started."
 
 if (Test-MaintenanceModeActive) {
-    Write-Log "Wartungsmodus aktiv. Ueberspringe Pruefung."
+    Write-Log "Maintenance mode active. Skipping check."
     return
 }
 
 if (Test-IntendedShutdownPending) {
-    Write-Log "Beabsichtigter Shutdown/Reboot erkannt (Event 1074 innerhalb der letzten $ShutdownLookbackMinutes Min.). Ueberspringe Pruefung."
+    Write-Log "Intentional shutdown/reboot detected (Event 1074 within the last $ShutdownLookbackMinutes min.). Skipping check."
     return
 }
 
 if (Test-InStartupGracePeriod) {
     $bootTime = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime
-    Write-Log "System befindet sich noch in der Startup-Grace-Period (Boot: $bootTime, Fenster: $StartupGraceMinutes Min.). Ueberspringe Pruefung."
+    Write-Log "System is still within the startup grace period (boot: $bootTime, window: $StartupGraceMinutes min.). Skipping check."
     return
 }
 
-Write-Log "Keine Gates aktiv. Fuehre Prozesspruefung durch."
+Write-Log "No gates active. Running process check."
 
 $missingProcesses = Get-MissingAutomicProcesses
 
 if ($missingProcesses.Count -eq 0) {
-    Write-Log "Alle erforderlichen Automic-Prozesse laufen."
+    Write-Log "All required Automic processes are running."
 } else {
-    Write-Log ("Fehlende Prozesse: {0}" -f ($missingProcesses -join ', ')) -Level 'WARN'
+    Write-Log ("Missing processes: {0}" -f ($missingProcesses -join ', ')) -Level 'WARN'
     Start-AutomicProcesses -ProcessNames $missingProcesses
 }
 
-Write-Log "Pruefung beendet."
+Write-Log "Check finished."
