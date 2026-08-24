@@ -64,24 +64,21 @@ $ShutdownLookbackMinutes = 5
 # is assumed to still be bringing processes up in an orderly fashion.
 $StartupGraceMinutes = 10
 
-# Windows service name of the Automic Service Manager.
-$ServiceManagerServiceName = 'UC4.ServiceManager.WS21'
-
 # Path to the SMC configuration file that defines the expected processes.
-$SmcFilePath = 'C:\uc4\V21.0\ServiceManager\bin\ws21.smc'
+$SmcFilePath = 'D:\Automic\UC4T\ServiceManager\bin\UC4T.smc'
 
 # Path to ucybsmcl.exe (Service Manager CLI).
-$UcybsmclPath = 'C:\uc4\V21.0\ServiceManagerDialog\bin\ucybsmcl.exe'
+$UcybsmclPath = 'D:\Automic\UC4T\ServiceManagerDialog\bin\ucybsmcl.exe'
 
 # Computer name (including port) for the -h parameter of ucybsmcl.
-$ServiceManagerComputerName = $env:COMPUTERNAME + ':18821'
+$ServiceManagerComputerName = $env:COMPUTERNAME + ':8471'
 
 # Service Manager environment ("Phrase") for the -n parameter of ucybsmcl.
-$ServiceManagerPhrase = 'ws21'
+$ServiceManagerPhrase = 'UC4T'
 
 # Path to the maintenance flag file. File exists = maintenance mode active.
 # See the doc comment on Test-MaintenanceModeActive for format and behavior.
-$MaintenanceFlagFilePath = 'C:\ProgramData\AutomicMonitoring\maintenance.flag'
+$MaintenanceFlagFilePath = 'D:\Automic\UC4T\maintenance.flag'
 
 # Minimum level that gets logged: DEBUG < INFO < WARN < ERROR.
 # Leave at INFO for normal operation; set to DEBUG for troubleshooting - this
@@ -91,6 +88,7 @@ $MinimumLogLevel = 'INFO'
 # Optional log file path. $null = console output only (e.g. for interactive
 # testing, or when the scheduled task already captures the output itself).
 $LogFile = $null   # e.g. 'C:\Logs\Check-AutomicProcesses.log'
+$LogFile = "D:\Automic\UC4T\Watchdog\AutomicProcessesWatchdog.log"
 
 # Log entries older than this many days are automatically removed
 # (roughly 6 months). Cleanup runs only once a day (see Invoke-LogFileCleanup),
