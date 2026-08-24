@@ -5,7 +5,8 @@
     required processes are running and automatically restarts any that are missing.
 
 .DESCRIPTION
-    The script skips its check/restart logic in three situations:
+    The script skips its check/restart logic for the ENTIRE run in three
+    situations:
       1. A manual maintenance mode has been activated via a flag file
          (see Test-MaintenanceModeActive).
       2. An intentional system shutdown/reboot is currently in progress
@@ -13,6 +14,12 @@
       3. The server has just booted and the Automic Service Manager is
          presumably still bringing processes up in an orderly fashion
          (grace period based on LastBootUpTime).
+
+    In addition, restarting a SINGLE process (not the whole run) is skipped
+    once that process has been restarted too often in too short a time -
+    see the ENDLESS-LOOP PROTECTION section and Invoke-EndlessLoopCheck.
+    This is what actually prevents the watchdog from restarting a
+    persistently crashing process forever ("sich im Kreise starten").
 
 .USAGE
     Intended to run as a recurring task in Windows Task Scheduler:
@@ -41,11 +48,15 @@
       this is intentional and harmless. With very large log files and very
       short intervals (< 1 minute), the window may need to be narrowed.
 
+      The endless-loop protection (see below) also reads $LogFile and
+      therefore requires it to be configured - without a persisted log file
+      there is no history to evaluate restart frequency against.
+
 .NOTES
     Author:     René Kappel
     Repository: https://github.com/rkappel/Automic-Process-Watchdog
     License:    MIT
-    Version:    1.0.0
+    Version:    1.1.0
     Created:    2026-08-21
 #>
 
@@ -68,10 +79,10 @@ $StartupGraceMinutes = 10
 $ProcessStartDelaySeconds = 5
 
 # Path to the SMC configuration file that defines the expected processes.
-$SmcFilePath = 'D:\Automic\UC4T\ServiceManager\bin\UC4T.smc'
+$SmcFilePath = 'D:\Automic\UC4\ServiceManager\bin\UC4.smc'
 
 # Path to ucybsmcl.exe (Service Manager CLI).
-$UcybsmclPath = 'D:\Automic\UC4T\ServiceManagerDialog\bin\ucybsmcl.exe'
+$UcybsmclPath = 'D:\Automic\UC4\ServiceManagerDialog\bin\ucybsmcl.exe'
 
 # Regex-String to match the smc entries which shall be monitored
 $ProcessNameRegex = "(?!"+$env:COMPUTERNAME+"_).*"
@@ -80,11 +91,34 @@ $ProcessNameRegex = "(?!"+$env:COMPUTERNAME+"_).*"
 $ServiceManagerComputerName = $env:COMPUTERNAME + ':8471'
 
 # Service Manager environment ("Phrase") for the -n parameter of ucybsmcl.
-$ServiceManagerPhrase = 'UC4T'
+$ServiceManagerPhrase = 'UC4'
 
 # Path to the maintenance flag file. File exists = maintenance mode active.
 # See the doc comment on Test-MaintenanceModeActive for format and behavior.
-$MaintenanceFlagFilePath = 'D:\Automic\UC4T\maintenance.flag'
+$MaintenanceFlagFilePath = 'D:\Automic\UC4\Watchdog\maintenance.flag'
+
+# --- Endless-loop protection ---
+# Time window (minutes) used to count recent restart attempts per process.
+$EndlessLoopLookbackMinutes = 30
+
+# Maximum number of restart attempts allowed for the same process within
+# $EndlessLoopLookbackMinutes. One more attempt than this creates a
+# "LoopProtection_<ProcessName>.flag" file instead of starting the process;
+# that process is then skipped on every subsequent run until the file is
+# deleted manually. See the ENDLESS-LOOP PROTECTION section below.
+$EndlessLoopMaxRestarts = 3
+
+# Folder where LoopProtection_<ProcessName>.flag files are created.
+$EndlessLoopFlagDirectory = 'D:\Automic\UC4\Watchdog'
+
+# Performance safeguard: instead of reading the entire log file, only the
+# last this-many lines are scanned per run for the endless-loop check. Must
+# comfortably cover $EndlessLoopLookbackMinutes worth of log entries even on
+# a busy run (several missing processes, WARN/ERROR lines, ...) - the
+# default is deliberately generous. Without this cap, a log file that has
+# grown large over a long retention period combined with a short scheduler
+# interval would make Get-Content read the whole file on every single run.
+$EndlessLoopLogTailLines = 5000
 
 # Minimum level that gets logged: DEBUG < INFO < WARN < ERROR.
 # Leave at INFO for normal operation; set to DEBUG for troubleshooting - this
@@ -93,13 +127,15 @@ $MinimumLogLevel = 'INFO'
 
 # Optional log file path. $null = console output only (e.g. for interactive
 # testing, or when the scheduled task already captures the output itself).
-$LogFile = $null   # e.g. 'C:\Logs\Check-AutomicProcesses.log'
-$LogFile = "D:\Automic\UC4T\Watchdog\AutomicProcessesWatchdog.log"
+# NOTE: the endless-loop protection (see below) needs this to be set - it
+# reads recent restart attempts back out of this file.
+#$LogFile = $null   # e.g. 'C:\Logs\Check-AutomicProcesses.log'
+$LogFile = "D:\Automic\UC4\Watchdog\AutomicProcessesWatchdog.log"
 
 # Log entries older than this many days are automatically removed
 # (roughly 6 months). Cleanup runs only once a day (see Invoke-LogFileCleanup),
 # not on every 5-minute run.
-$LogRetentionDays = 180
+$LogRetentionDays = 100
 
 
 # ============================================================
@@ -261,10 +297,19 @@ function Test-MaintenanceModeActive {
 
         FLAG FILE FORMAT (one "Key: Value" line per entry, English keys):
 
-            Until: 2026-08-21 14:00
+            From: 2026-08-25 22:00
+            Until: 2026-08-26 02:00
             Reason: Patchday
-            By: René
+            By: <name>
 
+        - From   : Optional. Format 'yyyy-MM-dd HH:mm' (or any format
+                   recognized by [DateTime]::TryParse). Lets a maintenance
+                   window be scheduled in advance: before this point in time
+                   the flag file is ignored entirely (maintenance mode is NOT
+                   active yet). Unlike an expired Until, a not-yet-started
+                   From is deliberately NOT deleted - it is scheduled, not
+                   expired. If omitted, maintenance mode is active as soon as
+                   the file exists.
         - Until  : Optional, but recommended. Format 'yyyy-MM-dd HH:mm' (or
                    any format recognized by [DateTime]::TryParse). Acts as a
                    safety net: once this point in time has passed, maintenance
@@ -279,8 +324,14 @@ function Test-MaintenanceModeActive {
 
         Activating/ending maintenance mode only requires creating/deleting
         this file - the script itself does not need to be touched, e.g.:
+
+          Immediate, for the next 2 hours:
             "Until: $((Get-Date).AddHours(2).ToString('yyyy-MM-dd HH:mm'))`nReason: Patchday`nBy: $env:USERNAME" |
-                Set-Content 'C:\ProgramData\AutomicMonitoring\maintenance.flag'
+                Set-Content 'D:\Automic\UC4\Watchdog\maintenance.flag'
+
+          Scheduled in advance, e.g. next Saturday 22:00-02:00:
+            "From: 2026-08-29 22:00`nUntil: 2026-08-30 02:00`nReason: Patchday`nBy: $env:USERNAME" |
+                Set-Content 'D:\Automic\UC4\Watchdog\maintenance.flag'
     #>
     param(
         [string]$Path = $MaintenanceFlagFilePath
@@ -299,19 +350,40 @@ function Test-MaintenanceModeActive {
 
     $reason = if ($fields.ContainsKey('Reason')) { $fields['Reason'] } else { '(not specified)' }
     $by     = if ($fields.ContainsKey('By'))     { $fields['By'] }     else { '(not specified)' }
+    $now    = Get-Date
 
+    # --- From: has the maintenance window started yet? ---
+    if ($fields.ContainsKey('From')) {
+        $fromRaw    = $fields['From']
+        $parsedFrom = [DateTime]::MinValue
+
+        if ([DateTime]::TryParse($fromRaw, [ref]$parsedFrom)) {
+            if ($now -lt $parsedFrom) {
+                # Scheduled for the future - not active yet, and deliberately
+                # NOT deleted: this is a planned window, not an expired one.
+                Write-Log "Maintenance flag found, but 'From' ($fromRaw) is still in the future - not active yet." -Level 'DEBUG'
+                return $false
+            }
+        } else {
+            Write-Log "Maintenance flag: could not parse 'From' value '$fromRaw' - ignoring it." -Level 'WARN'
+        }
+    }
+
+    # --- Until: has the maintenance window already ended? ---
     if ($fields.ContainsKey('Until')) {
         $untilRaw    = $fields['Until']
         $parsedUntil = [DateTime]::MinValue
 
         if ([DateTime]::TryParse($untilRaw, [ref]$parsedUntil)) {
-            $now = Get-Date
             Write-Log "Maintenance flag: comparing Now ($($now.ToString('yyyy-MM-dd HH:mm:ss'))) with Until ($($parsedUntil.ToString('yyyy-MM-dd HH:mm:ss')))." -Level 'DEBUG'
 
             if ($now -gt $parsedUntil) {
                 Write-Log "Maintenance flag found, but 'Until' ($untilRaw) is in the past - ignoring it." -Level 'WARN'
 
                 # Best effort: automatically clean up the expired flag file.
+                # Only reached once Until has actually passed - a flag that
+                # is merely scheduled for the future (From still ahead) is
+                # never touched here, see the From check above.
                 # A failure (e.g. missing permissions, file currently locked)
                 # is deliberately only logged as WARN and ignored - the next
                 # run will simply try to delete it again.
@@ -380,11 +452,14 @@ function Test-InStartupGracePeriod {
 function Get-RequiredAutomicProcesses {
     <#
         Reads the SMC file line by line and returns the names of the active
-        'create' entries. Disabled lines (e.g. "!reate ...") deliberately do
-        not match, since they don't start with 'create'.
+        'create' entries whose name matches $ProcessNameRegex. Disabled lines
+        (e.g. "!reate ...") deliberately do not match, since they don't start
+        with 'create'.
 
-        Regex restricted to WP/CP/JWP/JCP/REST processes (tailored to the
-        actual environment).
+        $ProcessNameRegex is fully configurable (see CONFIGURATION section
+        above); the shipped default excludes entries prefixed with the local
+        computer name (e.g. host-specific remote-agent entries), keeping
+        only the centrally managed processes.
     #>
     param(
         [string]$Path = $SmcFilePath
@@ -396,7 +471,7 @@ function Get-RequiredAutomicProcesses {
     }
 
     $required = foreach ($line in Get-Content -LiteralPath $Path) {
-         if ($line -match "^\s*create\s+("+$ProcessNameRegex+")") {
+        if ($line -match "^\s*create\s+("+$ProcessNameRegex+")") {
             $Matches[1]
         }
     }
@@ -474,6 +549,151 @@ function Get-MissingAutomicProcesses {
 
 
 # ============================================================
+# ENDLESS-LOOP PROTECTION (per process, not a global gate)
+#
+# Purpose: if a process crashes right after every restart (a real bug, not
+# a transient issue), the watchdog would otherwise detect it missing again
+# on the very next run and restart it again - forever, every 5 minutes,
+# without ever fixing anything and without anyone necessarily noticing.
+# This protection interrupts that cycle by counting restart attempts per
+# process (from the log file) and, once too many happened in too short a
+# time, refusing to start that one process any further until a human has
+# looked at it and removed the protection file. Deliberately manual-only
+# recovery, no automatic expiry - see Invoke-EndlessLoopCheck below.
+# ============================================================
+
+function Get-EndlessLoopProtectionFlagPath {
+    <#
+        Builds the path of the endless-loop protection flag file for a given
+        process name. Characters that are not allowed in Windows file names
+        (\ / : * ? " < > |) are replaced with '_', since Automic process
+        names can contain them (e.g. an AWI entry like
+        "AWI - http://uc4:8021/awi/").
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProcessName
+    )
+
+    $safeName = $ProcessName -replace '[\\/:*?"<>|]', '_'
+    return Join-Path -Path $EndlessLoopFlagDirectory -ChildPath "LoopProtection_$safeName.flag"
+}
+
+function Test-EndlessLoopProtectionActive {
+    <#
+        Returns $true if an endless-loop protection flag file already exists
+        for this process, i.e. automatic restarts for it are currently
+        suspended. The file must be removed manually before the watchdog
+        will attempt to start this process again - there is no automatic
+        expiry, unlike the maintenance flag.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProcessName
+    )
+
+    return (Test-Path -LiteralPath (Get-EndlessLoopProtectionFlagPath -ProcessName $ProcessName))
+}
+
+function Invoke-EndlessLoopCheck {
+    <#
+        Looks at the log file to see how often a restart of $ProcessName has
+        already been attempted within the last $LookbackMinutes minutes. If
+        that count has already reached $MaxRestarts, one more attempt would
+        exceed the limit - this process is very likely stuck in a restart
+        loop, and this next attempt is skipped instead of being made.
+
+        In that case, a "LoopProtection_<ProcessName>.flag" file is created
+        containing the matching log excerpt as evidence, and this function
+        returns $true - the caller must then skip starting the process this
+        round. Requires $LogFile to be configured; without a persisted log
+        there is no history to evaluate, so the check is effectively
+        disabled in that case (logged once as WARN).
+
+        Recovery is intentionally manual only: the flag file must be deleted
+        by an administrator once the underlying cause has been fixed. There
+        is no automatic expiry - a process that keeps crashing right after
+        being restarted is very likely a real bug, and silently retrying it
+        forever (or after a cooldown) would just hide that instead of
+        surfacing it.
+
+        PERFORMANCE: reading the log file is the expensive part here, not the
+        regex matching - large log files (long retention, short scheduler
+        interval) can run into the tens or hundreds of MB. Two things keep
+        this cheap:
+          - Only the last $EndlessLoopLogTailLines lines are read (via
+            Get-Content -Tail), never the whole file - see the comment on
+            that setting in the CONFIGURATION section for why that's safe.
+          - When called from Start-AutomicProcesses for several missing
+            processes in the same run, pass the same pre-loaded $LogLines in
+            to avoid reading (even just the tail of) the log file again for
+            every single process.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProcessName,
+
+        [int]$LookbackMinutes = $EndlessLoopLookbackMinutes,
+        [int]$MaxRestarts     = $EndlessLoopMaxRestarts,
+
+        # Optional: pre-loaded log tail, so a caller checking several
+        # processes in the same run only has to read the log file once.
+        # Falls back to reading $LogFile's tail itself if not supplied.
+        [string[]]$LogLines
+    )
+
+    if (-not $LogFile) {
+        Write-Log "Endless-loop protection needs `$LogFile to be configured - skipping the check for '$ProcessName'." -Level 'WARN'
+        return $false
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('LogLines')) {
+        if (-not (Test-Path -LiteralPath $LogFile)) {
+            Write-Log "Endless-loop protection: log file not found ($LogFile) - skipping the check for '$ProcessName'." -Level 'WARN'
+            return $false
+        }
+        $LogLines = @(Get-Content -LiteralPath $LogFile -Tail $EndlessLoopLogTailLines)
+    }
+
+    $since         = (Get-Date).AddMinutes(-$LookbackMinutes)
+    $escapedName   = [regex]::Escape($ProcessName)
+    $pattern       = "^(?<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+\[\w+\]\s+Starting process '$escapedName' \.\.\.$"
+
+    $recentAttempts = foreach ($line in $LogLines) {
+        if ($line -match $pattern) {
+            $ts = [DateTime]::ParseExact($Matches.ts, 'yyyy-MM-dd HH:mm:ss', $null)
+            if ($ts -ge $since) { $line }
+        }
+    }
+    $recentAttempts = @($recentAttempts)
+
+    if ($recentAttempts.Count -lt $MaxRestarts) {
+        return $false
+    }
+
+    Write-Log "Process '$ProcessName' has been restarted $($recentAttempts.Count) times within the last $LookbackMinutes minutes (limit: $MaxRestarts). Automatic restarts for this process are now stopped - remove the protection file manually once the cause has been fixed." -Level 'ERROR'
+
+    $flagPath = Get-EndlessLoopProtectionFlagPath -ProcessName $ProcessName
+    try {
+        $header = @(
+            "Endless-loop protection activated for process '$ProcessName' at $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')).",
+            "Restarted $($recentAttempts.Count) times within the last $LookbackMinutes minutes (limit: $MaxRestarts).",
+            "Delete this file to let the watchdog try starting this process again.",
+            "",
+            "Matching log excerpt:"
+        ) -join [Environment]::NewLine
+
+        ($header, ($recentAttempts -join [Environment]::NewLine)) -join [Environment]::NewLine |
+            Set-Content -LiteralPath $flagPath -Encoding UTF8
+    } catch {
+        Write-Log "Could not create the endless-loop protection file for '$ProcessName' ($flagPath): $($_.Exception.Message)" -Level 'ERROR'
+    }
+
+    return $true
+}
+
+
+# ============================================================
 # Restart missing processes
 # ============================================================
 
@@ -482,13 +702,40 @@ function Start-AutomicProcesses {
         Starts the given process names one after another via
         "ucybsmcl -c START_PROCESS". A failed start does not abort the loop -
         it's logged and the remaining processes are still attempted.
+
+        Before each start, two independent checks can skip a process:
+          - Test-EndlessLoopProtectionActive: a protection file from an
+            earlier run already exists for this process.
+          - Invoke-EndlessLoopCheck: this process has not been protected yet,
+            but this attempt would push it over the restart limit - so
+            protection is activated now, and this attempt is skipped too.
+
+        The log tail used by Invoke-EndlessLoopCheck is read once here (not
+        once per process) and passed into every call - see the PERFORMANCE
+        note on Invoke-EndlessLoopCheck.
     #>
     param(
         [Parameter(Mandatory)]
         [string[]]$ProcessNames
     )
 
+    $logTail = if ($LogFile -and (Test-Path -LiteralPath $LogFile)) {
+        @(Get-Content -LiteralPath $LogFile -Tail $EndlessLoopLogTailLines)
+    } else {
+        @()
+    }
+
     foreach ($name in $ProcessNames) {
+
+        if (Test-EndlessLoopProtectionActive -ProcessName $name) {
+            Write-Log "Endless-loop protection is active for process '$name' - skipping automatic restart. Remove '$(Get-EndlessLoopProtectionFlagPath -ProcessName $name)' manually once the cause has been fixed." -Level 'WARN'
+            continue
+        }
+
+        if (Invoke-EndlessLoopCheck -ProcessName $name -LogLines $logTail) {
+            continue
+        }
+
         Write-Log "Starting process '$name' ..."
 
         $result = Invoke-Ucybsmcl -Context "START_PROCESS '$name'" -ArgumentList @(
@@ -501,6 +748,7 @@ function Start-AutomicProcesses {
         if ($result.Success) {
             Write-Log "Process '$name' started successfully."
         }
+
         Start-Sleep $ProcessStartDelaySeconds
         # Failure is already logged compactly by Invoke-Ucybsmcl.
     }
@@ -543,3 +791,4 @@ if ($missingProcesses.Count -eq 0) {
 }
 
 Write-Log "Check finished."
+
