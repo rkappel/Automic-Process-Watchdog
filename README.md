@@ -1,79 +1,79 @@
 # Automic Watchdog
 
-Ein PowerShell-Watchdog-Skript für [Automic (UC4) Automation Engine](https://docs.automic.com/) auf Windows: prüft in regelmäßigen Abständen, ob alle über die `ServiceManager`-SMC-Datei definierten Prozesse laufen, und startet fehlende automatisch über die `ServiceManager`-CLI (`ucybsmcl`) nach.
+A PowerShell watchdog script for [Automic (UC4) Automation Engine](https://docs.automic.com/) on Windows: periodically checks whether all processes defined in the Service Manager's SMC file are running, and automatically restarts any that are missing via the Service Manager CLI (`ucybsmcl`).
 
 ## Features
 
-- **Prozessprüfung gegen die SMC-Datei** – liest die aktiven `create`-Einträge aus der `ServiceManager`-Konfigurationsdatei und gleicht sie mit `ucybsmcl -c GET_PROCESS_LIST` ab.
-- **Automatischer Nachstart** fehlender Prozesse über `ucybsmcl -c START_PROCESS`.
-- **Drei "Gates"**, die eine Prüfung/Aktion bewusst überspringen:
-  - **Wartungsmodus** über eine zentral wart- und lesbare Flag-Datei (kein Skript-Zugriff nötig, siehe unten).
-  - **Beabsichtigter Shutdown/Reboot** – erkannt über Event-ID 1074 im System-Log.
-  - **Startup-Grace-Period** – toleriert, dass der Service Manager nach einem Boot noch geordnet hochfährt.
-- **Kompaktes Logging** mit Log-Level (`DEBUG`/`INFO`/`WARN`/`ERROR`), optionalem File-Sink und automatischer Alt-Eintrag-Bereinigung.
-- Fehlerausgaben von `ucybsmcl` werden nicht mehr vollständig geloggt (der komplette Hilfetext bei Fehlern), sondern kompakt auf eine Zeile zusammengefasst; die Rohausgabe bleibt auf `DEBUG`-Level abrufbar.
+- **Process check against the SMC file** – reads the active `create` entries from the Service Manager configuration file and compares them against `ucybsmcl -c GET_PROCESS_LIST`.
+- **Automatic restart** of missing processes via `ucybsmcl -c START_PROCESS`.
+- **Three "gates"** that deliberately skip a check/action:
+  - **Maintenance mode** via a centrally maintainable, readable flag file (no need to touch the script, see below).
+  - **Intentional shutdown/reboot** – detected via Event ID 1074 in the System log.
+  - **Startup grace period** – tolerates the Service Manager still bringing processes up in an orderly fashion after a boot.
+- **Compact logging** with log levels (`DEBUG`/`INFO`/`WARN`/`ERROR`), an optional file sink, and automatic cleanup of old entries.
+- `ucybsmcl` error output is no longer logged in full (the complete help text on failure) but condensed to a single line; the raw output stays available at `DEBUG` level.
 
-## Voraussetzungen
+## Requirements
 
-- Windows Server 2016 oder neuer, PowerShell 5.1
-- Automic Automation Engine mit ServiceManager (`ucybsmcl.exe`)
-- Ausführendes Konto benötigt:
-  - Leserechte auf die SMC-Datei und die Wartungsflag-Datei
-  - Ausführungsrechte für `ucybsmcl.exe`
-  - Leserechte auf das System-Event-Log (Event-ID 1074)
+- Windows Server 2016 or newer, PowerShell 5.1
+- Automic Automation Engine with Service Manager (`ucybsmcl.exe`)
+- The executing account needs:
+  - Read access to the SMC file and the maintenance flag file
+  - Permission to execute `ucybsmcl.exe`
+  - Read access to the System event log (Event ID 1074)
 
-## Konfiguration
+## Configuration
 
-Alle Einstellungen befinden sich im Konfigurationsblock am Anfang von [`Invoke-AutomicWatchdog.ps1`](./Invoke-AutomicWatchdog.ps1) – kein Parsen von Kommandozeilenargumenten, bewusst einfach gehalten für den Einsatz als Scheduled Task:
+All settings live in the configuration block at the top of [`Invoke-AutomicWatchdog.ps1`](./Invoke-AutomicWatchdog.ps1) – no command-line argument parsing, deliberately kept simple for use as a scheduled task:
 
-| Variable | Bedeutung |
+| Variable | Purpose |
 |---|---|
-| `$ShutdownLookbackMinutes` | Zeitfenster, in dem ein Event 1074 als aktueller Shutdown gilt |
-| `$StartupGraceMinutes` | Zeitfenster nach dem Boot, in dem Prüfungen übersprungen werden |
-| `$ServiceManagerServiceName` | Windows-Servicename des Automic Service Managers |
-| `$SmcFilePath` | Pfad zur SMC-Konfigurationsdatei |
-| `$UcybsmclPath` | Pfad zu `ucybsmcl.exe` |
-| `$ServiceManagerComputerName` | `-h`-Parameter für `ucybsmcl` (inkl. Port, falls nötig) |
-| `$ServiceManagerPhrase` | `-n`-Parameter für `ucybsmcl` (ServiceManager-Environment) |
-| `$MaintenanceFlagFilePath` | Pfad zur Wartungsflag-Datei |
-| `$MinimumLogLevel` | Ab welchem Level geloggt wird |
-| `$LogFile` | Optionaler Pfad zur Logdatei (`$null` = nur Konsole) |
-| `$LogRetentionDays` | Logeinträge älter als diese Anzahl Tage werden automatisch entfernt |
+| `$ShutdownLookbackMinutes` | Time window in which an Event 1074 counts as an ongoing shutdown |
+| `$StartupGraceMinutes` | Time window after boot during which checks are skipped |
+| `$ServiceManagerServiceName` | Windows service name of the Automic Service Manager |
+| `$SmcFilePath` | Path to the SMC configuration file |
+| `$UcybsmclPath` | Path to `ucybsmcl.exe` |
+| `$ServiceManagerComputerName` | `-h` parameter for `ucybsmcl` (including port if needed) |
+| `$ServiceManagerPhrase` | `-n` parameter for `ucybsmcl` (Service Manager environment) |
+| `$MaintenanceFlagFilePath` | Path to the maintenance flag file |
+| `$MinimumLogLevel` | Minimum level that gets logged |
+| `$LogFile` | Optional path to the log file (`$null` = console only) |
+| `$LogRetentionDays` | Log entries older than this many days are removed automatically |
 
-## Wartungsmodus
+## Maintenance mode
 
-Prüfungen lassen sich ohne Eingriff ins Skript zentral pausieren, indem eine Flag-Datei angelegt wird (Pfad siehe `$MaintenanceFlagFilePath`):
+Checks can be paused centrally, without touching the script, by creating a flag file (path: `$MaintenanceFlagFilePath`):
 
 ```
 Until: 2026-08-21 14:00
 Reason: Patchday
-By: <Name>
+By: <name>
 ```
 
-- `Until` (optional, empfohlen): Ablaufzeitpunkt (`yyyy-MM-dd HH:mm`). Ist der Zeitpunkt überschritten, gilt der Wartungsmodus als beendet – das Skript versucht die Datei zusätzlich automatisch zu löschen (best effort, Fehler werden ignoriert). Fehlt `Until`, bleibt der Modus unbegrenzt aktiv.
-- `Reason`, `By` (optional): rein informativ, landen im Log.
+- `Until` (optional, recommended): expiry timestamp (`yyyy-MM-dd HH:mm`). Once this point has passed, maintenance mode is considered over – the script additionally attempts to delete the file automatically (best effort, failures are ignored). If `Until` is omitted, maintenance mode stays active indefinitely.
+- `Reason`, `By` (optional): informational only, go into the log.
 
-Aktivieren:
+Activate:
 
 ```powershell
 "Until: $((Get-Date).AddHours(2).ToString('yyyy-MM-dd HH:mm'))`nReason: Patchday`nBy: $env:USERNAME" |
     Set-Content 'C:\ProgramData\AutomicMonitoring\maintenance.flag'
 ```
 
-Beenden: Datei löschen (oder Ablaufzeit abwarten).
+Deactivate: delete the file (or let it expire).
 
-## Einrichtung als Scheduled Task
+## Setting up as a scheduled task
 
-Siehe ausführliche `.USAGE`-Sektion im Skriptkopf. Kurzfassung:
+See the full `.USAGE` section in the script header. Short version:
 
 ```
-Aktion:    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Pfad\zu\Invoke-AutomicWatchdog.ps1"
-Trigger:   täglich, "Aufgabe wiederholen alle: 5 Minuten", Dauer: unbegrenzt
-Konto:     Dienstkonto mit den oben genannten Rechten, unabhängig von der Anmeldung ausführen
+Action:   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\Invoke-AutomicWatchdog.ps1"
+Trigger:  daily, "Repeat task every: 5 minutes", duration: indefinitely
+Account:  service account with the permissions listed above, run whether user is logged on or not
 ```
 
-> **Hinweis:** Die tägliche Log-Bereinigung ist an ein festes Stundenfenster (00:00–00:59 Serverzeit) gekoppelt. Bei sehr großen Scheduler-Intervallen (> 1 Stunde) kann die Bereinigung an einzelnen Tagen ausfallen – unkritisch, sie holt es am Folgetag nach. Details im Skriptkopf.
+> **Note:** Daily log cleanup is tied to a fixed one-hour window (00:00–00:59 server time). With very large scheduler intervals (> 1 hour), cleanup may be skipped on some days – harmless, it catches up the next day. Details in the script header.
 
-## Lizenz
+## License
 
 [MIT](./LICENSE)
