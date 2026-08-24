@@ -64,11 +64,17 @@ $ShutdownLookbackMinutes = 5
 # is assumed to still be bringing processes up in an orderly fashion.
 $StartupGraceMinutes = 10
 
+# Time to wait after each process start
+$ProcessStartDelaySeconds = 5
+
 # Path to the SMC configuration file that defines the expected processes.
 $SmcFilePath = 'D:\Automic\UC4T\ServiceManager\bin\UC4T.smc'
 
 # Path to ucybsmcl.exe (Service Manager CLI).
 $UcybsmclPath = 'D:\Automic\UC4T\ServiceManagerDialog\bin\ucybsmcl.exe'
+
+# Regex-String to match the smc entries which shall be monitored
+$ProcessNameRegex = "(?!"+$env:COMPUTERNAME+"_).*"
 
 # Computer name (including port) for the -h parameter of ucybsmcl.
 $ServiceManagerComputerName = $env:COMPUTERNAME + ':8471'
@@ -390,7 +396,7 @@ function Get-RequiredAutomicProcesses {
     }
 
     $required = foreach ($line in Get-Content -LiteralPath $Path) {
-        if ($line -match "^\s*create\s+(.*J?[WC]P.*|[^_]*REST[^_]*)") {
+         if ($line -match "^\s*create\s+("+$ProcessNameRegex+")") {
             $Matches[1]
         }
     }
@@ -495,6 +501,7 @@ function Start-AutomicProcesses {
         if ($result.Success) {
             Write-Log "Process '$name' started successfully."
         }
+        Start-Sleep $ProcessStartDelaySeconds
         # Failure is already logged compactly by Invoke-Ucybsmcl.
     }
 }
