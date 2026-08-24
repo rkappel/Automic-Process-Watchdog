@@ -1,0 +1,10 @@
+# Lokale/umgebungsspezifische Anpassungen nicht versehentlich committen
+*.local.ps1
+maintenance.flag
+*.log
+
+# Editor-/OS-Artefakte
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
